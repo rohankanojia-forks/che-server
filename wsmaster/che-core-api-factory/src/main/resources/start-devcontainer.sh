@@ -262,13 +262,23 @@ fi
 # devcontainer.json means lifecycle commands run as root and write root-owned node_modules
 # into the bind mount. Using --include-merged-configuration instead would need a registry
 # round-trip; the label is local and already merged.
-JQ_MERGE='
+# Extension ids in declaration order, from a value that may not be shaped like a config at all:
+# every step is total, because one odd `customizations` must not collapse the whole merge.
+JQ_EXT='
+def ids: (if type == "array" then . else [] end)
+         | map(select(type == "string" and length > 0))
+         | reduce .[] as $id ([]; if index($id) then . else . + [$id] end);
+def obj($k): if type == "object" then (.[$k] // {}) else {} end;
+def vsx: obj("customizations") | obj("vscode") | obj("extensions") | ids;
+'
+JQ_MERGE="$JQ_EXT"'
 def last_of($k): [ .[] | .[$k] // empty ] | last // null;
 def all_of($k):  [ .[] | .[$k] // empty ];
 { remoteUser: last_of("remoteUser"), containerUser: last_of("containerUser"),
   workspaceFolder: last_of("workspaceFolder"),
   remoteEnv:    ( [ .[] | .remoteEnv    // {} ] | add // {} ),
   containerEnv: ( [ .[] | .containerEnv // {} ] | add // {} ),
+  extensions:   ( [ .[] | vsx ] | add // [] | ids ),
   onCreateCommand: all_of("onCreateCommand"), updateContentCommand: all_of("updateContentCommand"),
   postCreateCommand: all_of("postCreateCommand"), postStartCommand: all_of("postStartCommand"),
   postAttachCommand: all_of("postAttachCommand") }'
@@ -280,17 +290,22 @@ if [ -n "$label" ]; then
   META="$(printf '%s' "$label" | jq -c "$JQ_MERGE" 2>/dev/null || echo '{}')"
 fi
 # Fall back to devcontainer.json for anything the label did not provide.
-META="$(jq -n --argjson m "$META" --argjson c "$CONFIG_JSON" '
+META="$(jq -n --argjson m "$META" --argjson c "$CONFIG_JSON" "$JQ_EXT"'
   { remoteUser: ($m.remoteUser // $c.remoteUser // $c.containerUser // null),
     workspaceFolder: ($m.workspaceFolder // $c.workspaceFolder // "/workspace"),
     remoteEnv: (($c.remoteEnv // {}) + ($m.remoteEnv // {})),
     containerEnv: (($c.containerEnv // {}) + ($m.containerEnv // {})),
+    extensions: ((($m.extensions | ids) + ($c | vsx)) | ids),
     hooks: { onCreateCommand: ($m.onCreateCommand // []), updateContentCommand: ($m.updateContentCommand // []),
              postCreateCommand: ($m.postCreateCommand // []), postStartCommand: ($m.postStartCommand // []),
              postAttachCommand: ($m.postAttachCommand // []) } }')"
 
 REMOTE_USER="$(printf '%s' "$META" | jq -r '.remoteUser // empty')"
 WORKSPACE_FOLDER="$(printf '%s' "$META" | jq -r '.workspaceFolder')"
+# The editor runs outside this container and cannot see what the image asks for, so the ids are
+# handed to it in the runtime description. Read from the label rather than devcontainer.json:
+# Features contribute extensions the repository never names.
+EXTENSIONS_JSON="$(printf '%s' "$META" | jq -c '.extensions // []' 2>/dev/null || echo '[]')"
 echo "  remoteUser=${REMOTE_USER:-<image default>}  workspaceFolder=${WORKSPACE_FOLDER}"
 
 env_args() {  # $1 = remoteEnv|containerEnv
@@ -431,13 +446,16 @@ publish_runtime() (
     --arg workspaceFolder "$WORKSPACE_FOLDER" --arg shell "$INNER_SHELL" \
     --arg fingerprint "$CONFIG_FINGERPRINT" --argjson remoteEnv "$remote_env_json" \
     --arg configPath "$CONFIG_PATH" --arg configFileFingerprint "$CONFIG_FILE_FINGERPRINT" \
+    --argjson extensions "${EXTENSIONS_JSON:-[]}" \
     '{version: 1, containerName: $containerName, containerId: $containerId,
       podmanPath: $podmanPath, image: $image, remoteUser: $remoteUser,
       workspaceFolder: $workspaceFolder, shell: $shell, remoteEnv: $remoteEnv,
       fingerprint: $fingerprint}
      + (if $configPath != "" and $configFileFingerprint != "" then
           {configPath: $configPath, configFileFingerprint: $configFileFingerprint}
-        else {} end)' > "$runtime_tmp" || return 1
+        else {} end)
+     + (if ($extensions | length) > 0 then {extensions: $extensions} else {} end)' \
+    > "$runtime_tmp" || return 1
   mv -f -- "$runtime_tmp" "$RUNTIME_FILE"
 )
 publish_runtime || { echo "could not publish devcontainer terminal configuration" >&2; exit 1; }
